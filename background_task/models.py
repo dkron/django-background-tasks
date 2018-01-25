@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from django.db import models
 from django.db.models import Q
+from django.db.utils import OperationalError
 from django.conf import settings
 from django.utils.encoding import python_2_unicode_compatible
 import django
@@ -32,7 +33,6 @@ try:
     from django.utils import six
 except ImportError:  # Django < 1.4.2
     import six
-
 
 if django.get_version() < '1.6':
     class GetQuerySetMetaclass(type):
@@ -149,11 +149,13 @@ class Task(models.Model):
 
     def lock(self, locked_by):
         now = timezone.now()
-        unlocked = Task.objects.unlocked(now).filter(pk=self.pk)
-        updated = unlocked.update(locked_by=locked_by, locked_at=now)
-        if updated:
-            return Task.objects.get(pk=self.pk)
-        return None
+        try:
+            unlocked = Task.objects.unlocked(now).select_for_update(nowait=True).filter(pk=self.pk)
+            updated = unlocked.update(locked_by=locked_by, locked_at=now)
+            if updated:
+                return Task.objects.get(pk=self.pk)
+        except OperationalError:
+            return None
 
     def _extract_error(self, type, err, tb):
         file = StringIO()
