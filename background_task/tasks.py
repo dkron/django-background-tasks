@@ -1,27 +1,22 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
+
 from datetime import datetime, timedelta
+from importlib import import_module
+from multiprocessing.pool import ThreadPool
 import logging
 import os
 import sys
-import threading
 
-from django.utils.encoding import python_2_unicode_compatible
 from django.utils import timezone
-from django.conf import settings
-
-from compat import atomic
-from compat import import_module
+from django.utils.six import python_2_unicode_compatible
 
 from background_task.exceptions import BackgroundTaskError
 from background_task.models import Task
-from background_task.signals import task_created, task_error, task_successful
-
+from background_task.settings import app_settings
+from background_task import signals
 
 logger = logging.getLogger(__name__)
-
-
-BACKGROUND_TASK_RUN_ASYNC = getattr(settings, 'BACKGROUND_TASK_RUN_ASYNC', False)
 
 
 def bg_runner(proxy_task, task=None, *args, **kwargs):
@@ -29,6 +24,7 @@ def bg_runner(proxy_task, task=None, *args, **kwargs):
     Executes the function attached to task. Used to enable threads.
     If a Task instance is provided, args and kwargs are ignored and retrieved from the Task itself.
     """
+    signals.task_started.send(Task)
     try:
         func = getattr(proxy_task, 'task_function', None)
         if isinstance(task, Task):
@@ -49,17 +45,38 @@ def bg_runner(proxy_task, task=None, *args, **kwargs):
             # task done, so can delete it
             task.increment_attempts()
             completed = task.create_completed_task()
-            task_successful.send(sender=task.__class__, task_id=task.id, completed_task=completed)
+            signals.task_successful.send(sender=task.__class__, task_id=task.id, completed_task=completed)
+            task.create_repetition()
             task.delete()
-            logging.info('Ran task and deleting %s', task)
+            logger.info('Ran task and deleting %s', task)
 
     except Exception as ex:
         t, e, traceback = sys.exc_info()
         if task:
-            logging.warn('Rescheduling %s', task, exc_info=(t, e, traceback))
-            task_error.send(sender=ex.__class__, task=task)
+            logger.error('Rescheduling %s', task, exc_info=(t, e, traceback))
+            signals.task_error.send(sender=ex.__class__, task=task)
             task.reschedule(t, e, traceback)
         del traceback
+    signals.task_finished.send(Task)
+
+
+class PoolRunner:
+    def __init__(self, bg_runner, num_processes):
+        self._bg_runner = bg_runner
+        self._num_processes = num_processes
+
+    _pool_instance = None
+
+    @property
+    def _pool(self):
+        if not self._pool_instance:
+            self._pool_instance = ThreadPool(processes=self._num_processes)
+        return self._pool_instance
+
+    def run(self, proxy_task, task=None, *args, **kwargs):
+        self._pool.apply_async(func=self._bg_runner, args=(proxy_task, task) + tuple(args), kwds=kwargs)
+
+    __call__ = run
 
 
 class Tasks(object):
@@ -68,6 +85,7 @@ class Tasks(object):
         self._runner = DBTaskRunner()
         self._task_proxy_class = TaskProxy
         self._bg_runner = bg_runner
+        self._pool_runner = PoolRunner(bg_runner, app_settings.BACKGROUND_TASK_ASYNC_THREADS)
 
     def background(self, name=None, schedule=None, queue=None):
         '''
@@ -106,9 +124,8 @@ class Tasks(object):
         else:
             task = None
         proxy_task = self._tasks[task_name]
-        if BACKGROUND_TASK_RUN_ASYNC:
-            curr_thread = threading.Thread(target=self._bg_runner, args=(proxy_task, task) + tuple(args), kwargs=kwargs)
-            curr_thread.start()
+        if app_settings.BACKGROUND_TASK_RUN_ASYNC:
+            self._pool_runner(proxy_task, task, *args, **kwargs)
         else:
             self._bg_runner(proxy_task, task, *args, **kwargs)
 
@@ -190,11 +207,12 @@ class DBTaskRunner(object):
         self.worker_name = str(os.getpid())
 
     def schedule(self, task_name, args, kwargs, run_at=None,
-                 priority=0, action=TaskSchedule.SCHEDULE, queue=None):
+                 priority=0, action=TaskSchedule.SCHEDULE, queue=None, verbose_name=None, creator=None,
+                 repeat=None, repeat_until=None):
         '''Simply create a task object in the database'''
 
         task = Task.objects.new_task(task_name, args, kwargs,
-                                     run_at, priority, queue)
+                                     run_at, priority, queue, verbose_name, creator, repeat, repeat_until)
 
         if action != TaskSchedule.SCHEDULE:
             task_hash = task.task_hash
@@ -212,10 +230,9 @@ class DBTaskRunner(object):
                     return
 
         task.save()
-        task_created.send(sender=self.__class__, task=task)
+        signals.task_created.send(sender=self.__class__, task=task)
         return task
 
-    @atomic
     def get_task_to_run(self, tasks, queue=None):
         available_tasks = Task.objects.find_available(queue).filter(task_name__in=tasks._tasks.keys())[:5]
 
@@ -226,20 +243,14 @@ class DBTaskRunner(object):
                 return locked_task
         return None
 
-    @atomic
     def run_task(self, tasks, task):
-        logging.info('Running %s', task)
+        logger.info('Running %s', task)
         tasks.run_task(task)
 
-    @atomic
     def run_next_task(self, tasks, queue=None):
-        # we need to commit to make sure
-        # we can see new tasks as they arrive
         task = self.get_task_to_run(tasks, queue)
-        # transaction.commit()
         if task:
             self.run_task(tasks, task)
-            # transaction.commit()
             return True
         else:
             return False
@@ -258,10 +269,15 @@ class TaskProxy(object):
         schedule = kwargs.pop('schedule', None)
         schedule = TaskSchedule.create(schedule).merge(self.schedule)
         run_at = schedule.run_at
-        priority = schedule.priority
+        priority = kwargs.pop('priority', schedule.priority)
         action = schedule.action
         queue = kwargs.pop('queue', self.queue)
-        return self.runner.schedule(self.name, args, kwargs, run_at, priority, action, queue)
+        verbose_name = kwargs.pop('verbose_name', None)
+        creator = kwargs.pop('creator', None)
+        repeat = kwargs.pop('repeat', None)
+        repeat_until = kwargs.pop('repeat_until', None)
+        return self.runner.schedule(self.name, args, kwargs, run_at, priority, action, queue,
+                                    verbose_name, creator, repeat, repeat_until)
 
     def __str__(self):
         return 'TaskProxy(%s)' % self.name
@@ -272,7 +288,6 @@ tasks = Tasks()
 def autodiscover():
     """
     Autodiscover tasks.py files in much the same way as admin app
-    TODO: Is this code needed? Seems to be legacy code
     """
     import imp
     from django.conf import settings

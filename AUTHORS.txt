@@ -11,5 +11,8 @@ Contributors
 * James Mason (bear454)
 * Pavel Zagrebelin (Zagrebelin)
 * Stephen Brown (december1981)
+* Adam Johnson (adamchainz)
+* (kherrett)
+* Johannes Dillmann (kleingeist)
 
 Your name could stand here :)
