@@ -10,7 +10,6 @@ from django.utils.encoding import python_2_unicode_compatible
 from django.utils import timezone
 from django.conf import settings
 
-from compat import atomic
 from compat import import_module
 
 from background_task.exceptions import BackgroundTaskError
@@ -215,7 +214,6 @@ class DBTaskRunner(object):
         task_created.send(sender=self.__class__, task=task)
         return task
 
-    @atomic
     def get_task_to_run(self, tasks, queue=None):
         available_tasks = Task.objects.find_available(queue).filter(task_name__in=tasks._tasks.keys())[:5]
 
@@ -226,20 +224,14 @@ class DBTaskRunner(object):
                 return locked_task
         return None
 
-    @atomic
     def run_task(self, tasks, task):
         logging.info('Running %s', task)
         tasks.run_task(task)
 
-    @atomic
     def run_next_task(self, tasks, queue=None):
-        # we need to commit to make sure
-        # we can see new tasks as they arrive
         task = self.get_task_to_run(tasks, queue)
-        # transaction.commit()
         if task:
             self.run_task(tasks, task)
-            # transaction.commit()
             return True
         else:
             return False
